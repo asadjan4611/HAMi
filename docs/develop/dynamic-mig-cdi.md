@@ -105,6 +105,196 @@ In this design, "reuse" means that an idempotent allocation finds the same
 still-live MIG instance for the same allocation key. Maintaining unused MIG
 instances as an idle pool is outside this proposal.
 
+## CDI Background
+
+### What CDI is and how it works
+
+The Container Device Interface (CDI) is a vendor-neutral specification for
+describing container devices. It separates two responsibilities:
+
+- a device owner describes the files, mounts, environment variables, and hooks
+  needed to use a device;
+- a CDI-enabled container runtime resolves a qualified device name and applies
+  those edits to the container's Open Container Initiative (OCI) specification.
+
+A qualified CDI name has this form:
+
+```text
+vendor/class=device
+```
+
+For example:
+
+```text
+k8s.device-plugin.nvidia.com/dynamic-mig=MIG-xxxxxxxx
+```
+
+CDI specifications normally live in runtime-watched directories such as
+`/etc/cdi` and `/var/run/cdi`. The runtime loads and caches those files. When
+kubelet asks it to inject a qualified name, the runtime finds the matching
+vendor/class and device entry, then applies the entry's container edits.
+
+```text
+Device owner writes CDI spec
+             |
+             v
+Runtime watches CDI directory
+             |
+             v
+Kubelet passes vendor/class=device
+             |
+             v
+Runtime resolves device entry
+             |
+             v
+Runtime applies OCI edits and starts container
+```
+
+CDI does not create hardware and does not schedule it. In this design, NVML
+creates the MIG GI/CI, HAMi publishes its description, and the runtime performs
+container injection.
+
+### What a CDI specification contains
+
+A CDI specification is a JSON or YAML document with:
+
+- `cdiVersion`, identifying the schema version;
+- `kind`, containing the vendor and class;
+- optional top-level `containerEdits`, applied whenever any device from the
+  specification is requested;
+- `devices`, containing a name and device-specific edits for each device.
+
+A simplified dynamic MIG specification looks like this:
+
+```yaml
+cdiVersion: "0.8.0"
+kind: "k8s.device-plugin.nvidia.com/dynamic-mig"
+containerEdits:
+  env:
+    - "NVIDIA_VISIBLE_DEVICES=void"
+  hooks:
+    - hookName: createContainer
+      path: /usr/bin/nvidia-cdi-hook
+      args:
+        - nvidia-cdi-hook
+        - create-symlinks
+        - --link
+        - ../libnvidia-ml.so.1::/usr/lib/libnvidia-ml.so
+devices:
+  - name: "MIG-xxxxxxxx"
+    containerEdits:
+      deviceNodes:
+        - path: /dev/nvidia0
+        - path: /dev/nvidia-caps/nvidia-cap42
+        - path: /dev/nvidia-caps/nvidia-cap43
+```
+
+This example is illustrative, not a hard-coded output template. The pinned
+NVIDIA Container Toolkit and CDI libraries determine the actual schema version,
+common edits, paths, permissions, mounts, and hooks. HAMi supplies the concrete
+parent GPU and GI/CI capability nodes for the live instance and validates the
+result before publication.
+
+The device name is local to its `kind`. Combining the example kind and device
+name produces:
+
+```text
+k8s.device-plugin.nvidia.com/dynamic-mig=MIG-xxxxxxxx
+```
+
+### How a Kubernetes device plugin uses CDI
+
+The device plugin remains responsible for advertising capacity and deciding
+which concrete device satisfies an Allocate request. CDI changes the delivery
+part of Allocate:
+
+1. The plugin prepares or selects the concrete device.
+2. The plugin ensures a valid CDI entry exists for it.
+3. The plugin returns the qualified name to kubelet.
+4. Kubelet forwards that name to a CDI-enabled runtime.
+5. The runtime resolves the CDI spec and injects the device.
+
+Kubernetes supports two response forms used by HAMi's existing configuration:
+
+- CDI CRI: place qualified names in
+  `ContainerAllocateResponse.CDIDevices`;
+- CDI annotations: encode qualified names in the configured CDI annotation for
+  runtimes that use the annotation path.
+
+The CDI file must be published before Allocate returns. Returning a name first
+creates a race in which kubelet or the runtime cannot resolve it.
+
+### NVIDIA legacy injection and CDI mode
+
+Both modes can use NVIDIA Container Toolkit components, but they select and
+describe devices differently.
+
+| Area | Legacy NVIDIA injection | CDI injection |
+| --- | --- | --- |
+| Device request | Environment variables such as `NVIDIA_VISIBLE_DEVICES`, plus mounts/device specs when configured | Qualified CDI name such as `vendor/class=device` |
+| Device description | NVIDIA runtime/toolkit discovers and applies edits from the legacy request at container creation | A generated CDI document declares the required OCI edits |
+| Runtime dependency | NVIDIA-aware runtime configuration or hooks process the legacy request | Container runtime must support CDI and watch the configured CDI directories |
+| Allocate response | Environment variables, mounts, and/or device nodes | `CDIDevices` or CDI annotations |
+| Dynamic update requirement | Raw MIG UUID can be passed through the legacy NVIDIA path | A resolvable CDI entry must exist before the qualified name is returned |
+
+CDI mode does not mean that the NVIDIA Container Toolkit is removed. HAMi uses
+the toolkit to generate correct NVIDIA-specific edits, and a generated spec can
+invoke `nvidia-cdi-hook`. CDI standardizes how the selected device and its edits
+are handed to the container runtime.
+
+HAMi must preserve the legacy path because existing clusters may not have CDI
+enabled in their runtime. Selecting a CDI device-list strategy explicitly
+enables the new synchronization path; selecting only a legacy strategy leaves
+the existing behavior unchanged.
+
+### How the NVIDIA DRA Driver implements Dynamic MIG
+
+The NVIDIA DRA Driver uses Kubernetes Dynamic Resource Allocation rather than
+the traditional device-plugin Allocate API. Its high-level lifecycle is:
+
+```text
+ResourceClaim allocation
+        |
+        v
+DRA kubelet plugin prepares claimed device
+        |
+        v
+Create or resolve dynamic MIG instance
+        |
+        v
+Build a claim-scoped transient CDI spec
+        |
+        v
+Checkpoint prepared device and CDI device IDs
+        |
+        v
+Kubelet/runtime inject qualified CDI device
+        |
+        v
+Unprepare claim -> remove CDI spec -> destroy MIG when no longer shared
+```
+
+Important implementation ideas used as references by this design are:
+
+- preparation resolves concrete hardware before publishing CDI state;
+- reusable NVIDIA CDI fragments are cached to reduce repeated discovery work;
+- dynamic MIG entries combine toolkit-generated parent/common edits with
+  explicit GI and CI capability device nodes;
+- a transient CDI specification is tied to the owning ResourceClaim;
+- prepared-device state and returned CDI device IDs are checkpointed for
+  recovery;
+- Unprepare removes the claim CDI specification and destroys the dynamic MIG
+  device only when it is no longer used;
+- startup cleanup reconciles hardware and checkpoint state instead of trusting
+  leftover files.
+
+HAMi cannot copy that lifecycle directly. HAMi uses Pod annotations, the
+device-plugin API, and its MIG instance manager instead of ResourceClaims and
+DRA Prepare/Unprepare calls. This design therefore adapts the same principles:
+publish after hardware realization, keep durable ownership information,
+reconcile at restart, remove CDI state with hardware lifecycle, and never
+return an unresolved CDI name.
+
 ## Existing Architecture
 
 The relevant ownership boundaries are:
@@ -791,3 +981,5 @@ model.
 - [Container Device Interface specification](https://github.com/cncf-tags/container-device-interface)
 - [NVIDIA DRA Driver for GPUs](https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu)
 - [NVIDIA DRA Driver releases](https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu/releases)
+- [NVIDIA DRA Driver CDI implementation](https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu/blob/main/cmd/gpu-kubelet-plugin/cdi.go)
+- [NVIDIA DRA Driver device lifecycle](https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu/blob/main/cmd/gpu-kubelet-plugin/device_state.go)
