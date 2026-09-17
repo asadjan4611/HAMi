@@ -403,7 +403,7 @@ MIG manager ------> | CDI lifecycle handler |
                                |
                                | atomic per-device write
                                v
-                    /var/run/cdi/hami-dynamic-mig-<stable-UUID-hash>.yaml
+                    /var/run/cdi/hami-dynamic-mig-<stable-UUID-hash>.json
                                |
                                v
                     containerd / CRI-O
@@ -443,9 +443,6 @@ type DynamicMIGDevice struct {
     ParentMinor      int
     GPUInstanceID    uint32
     ComputeInstanceID uint32
-    Profile          string
-    PlacementStart   uint32
-    PlacementSize    uint32
 }
 ```
 
@@ -467,7 +464,7 @@ HAMi writes one CDI specification per live, HAMi-managed MIG UUID. A file is
 named from a validated UUID, for example:
 
 ```text
-/var/run/cdi/hami-dynamic-mig-<stable-UUID-hash>.yaml
+/var/run/cdi/hami-dynamic-mig-<stable-UUID-hash>.json
 ```
 
 The actual path uses the configured CDI root instead of a hard-coded
@@ -693,48 +690,50 @@ successful allocation.
 ## Concurrency and Lock Ordering
 
 CDI lifecycle updates can race with concurrent Allocate calls, periodic
-reconciliation, and rollback. A lifecycle coordinator owns a keyed lock for
-each allocation key. The existing MIG manager keeps its per-GPU hardware
-locks. The CDI handler serializes only operations for the **same UUID**;
-independent files require no global publication lock.
+reconciliation, and rollback. The existing device-plugin `applyMutex`
+serializes Allocate and periodic reconciliation for one plugin instance.
+The MIG manager keeps its per-GPU hardware locks. The CDI handler serializes
+filesystem operations only for the **same UUID**; independent files require
+no global publication lock.
 
 The coordinator executes operations in this order:
 
 ```text
-allocation-key lifecycle lock
+device-plugin allocation lock
         |
         +--> MIG manager call (takes and releases its per-GPU lock)
         |
         +--> CDI ensure/remove for that UUID
 ```
 
-The manager's per-GPU lock is not held during CDI filesystem I/O. This avoids
-blocking unrelated NVML work on a slow disk. The allocation-key lock stays
-held across both calls, so create and destroy for the same logical allocation
-cannot pass each other. Different allocation keys can perform NVML work and
-CDI publication in parallel where the manager permits it. A multi-device
-request acquires keyed locks in deterministic order to avoid deadlock.
+The manager's per-GPU lock is not held during CDI filesystem I/O. The
+existing plugin lock stays held across both calls, so create and destroy for
+the same logical allocation cannot pass each other. This preserves the
+current plugin serialization policy rather than introducing a second
+allocation lock order.
 
 No CDI method may call the MIG manager, and no manager method may call the CDI
 handler. Periodic reconciliation must return the UUIDs of instances it
 **actually destroyed**, then remove only those CDI files through the
 coordinator. A stale list of desired allocations must never trigger a runtime
 full replacement. Before deleting a file after reconciliation, recheck under
-the keyed lock that the UUID has not been reused or adopted by another
+the allocation lock that the UUID has not been reused or adopted by another
 allocation. A missing, truncated, externally replaced, or invalid file is
 repaired only by an ensure for its live UUID.
 
 ## Allocation Response
 
-The dynamic path returns the qualified names produced by successive
-`EnsureDynamicMIGDevice` calls, rather than independently reconstructing them.
-This couples each returned identity to an entry that was actually published.
+The dynamic path ensures every requested entry before building a response.
+The response derives each qualified name from the same deterministic UUID
+mapping used by `EnsureDynamicMIGDevice`; no name is returned if any ensure
+fails. A test must check that the response name resolves to the published
+entry.
 
 The current response helper accepts raw device IDs and qualifies them as the
-`gpu` class. Dynamic MIG must not pass an already qualified name through that
-path, because doing so would qualify it twice. The response builder should
-accept an explicit list of qualified CDI names for dynamic devices while the
-existing raw-ID path remains unchanged for full GPUs and static MIG devices.
+`gpu` class. Dynamic MIG must select the dedicated class and CDI-safe name
+from the raw MIG UUID. It must not pass an already qualified name through
+that path, because doing so would qualify it twice. The existing raw-ID path
+remains unchanged for full GPUs and static MIG devices outside dynamic mode.
 
 For CDI annotations, add those names through the existing annotation helper.
 For CRI CDI, append them to `ContainerAllocateResponse.CDIDevices`. Additional
@@ -942,7 +941,7 @@ model.
 
 - Vendor: reuse `k8s.device-plugin.nvidia.com`.
 - Class: use `dynamic-mig` so HAMi owns a separate identity namespace.
-- Filename: use `hami-dynamic-mig-<stable-UUID-hash>.yaml` below the handler's CDI root.
+- Filename: use `hami-dynamic-mig-<stable-UUID-hash>.json` below the handler's CDI root.
 - CDI root: preserve `/var/run/cdi` as the default and inject it through an
   internal option for tests and future packaging needs.
 - Device edits: reuse toolkit common and parent-GPU edits, then construct the
