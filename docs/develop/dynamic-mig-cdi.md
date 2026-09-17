@@ -126,7 +126,7 @@ vendor/class=device
 For example:
 
 ```text
-k8s.device-plugin.nvidia.com/dynamic-mig=MIG-xxxxxxxx
+k8s.device-plugin.nvidia.com/dynamic-mig=mig-<stable-UUID-hash>
 ```
 
 CDI specifications normally live in runtime-watched directories such as
@@ -181,7 +181,7 @@ containerEdits:
         - --link
         - ../libnvidia-ml.so.1::/usr/lib/libnvidia-ml.so
 devices:
-  - name: "MIG-xxxxxxxx"
+  - name: "mig-<stable-UUID-hash>"
     containerEdits:
       deviceNodes:
         - path: /dev/nvidia0
@@ -199,7 +199,7 @@ The device name is local to its `kind`. Combining the example kind and device
 name produces:
 
 ```text
-k8s.device-plugin.nvidia.com/dynamic-mig=MIG-xxxxxxxx
+k8s.device-plugin.nvidia.com/dynamic-mig=mig-<stable-UUID-hash>
 ```
 
 ### How a Kubernetes device plugin uses CDI
@@ -403,7 +403,7 @@ MIG manager ------> | CDI lifecycle handler |
                                |
                                | atomic per-device write
                                v
-                    /var/run/cdi/hami-dynamic-mig-<UUID>.yaml
+                    /var/run/cdi/hami-dynamic-mig-<stable-UUID-hash>.yaml
                                |
                                v
                     containerd / CRI-O
@@ -413,7 +413,7 @@ The dynamic specification uses the existing HAMi/NVIDIA CDI vendor and a
 dedicated class, for example:
 
 ```text
-k8s.device-plugin.nvidia.com/dynamic-mig=MIG-xxxxxxxx
+k8s.device-plugin.nvidia.com/dynamic-mig=mig-<stable-UUID-hash>
 ```
 
 A separate class gives HAMi clear ownership and prevents a dynamic entry from
@@ -429,9 +429,12 @@ retain the existing base-spec behavior outside dynamic MIG mode.
 
 ## Device Identity and Mapping
 
-The canonical device name is the exact MIG UUID returned by NVML after format
-validation. UUIDs are treated as opaque identities and are not case-folded or
-otherwise rewritten. The CDI input record is:
+The hardware identity is the exact MIG UUID returned by NVML. UUIDs are
+treated as opaque identities and are not case-folded or rewritten. Some valid
+MIG UUID formats contain `/`, which CDI device names forbid. Therefore the
+CDI device name and filename use a deterministic `mig-` plus a SHA-256 digest
+of the exact UUID. The file remains associated with the original UUID, and
+repeated requests for that UUID produce the same name. The CDI input record is:
 
 ```go
 type DynamicMIGDevice struct {
@@ -446,18 +449,17 @@ type DynamicMIGDevice struct {
 }
 ```
 
-The MIG UUID is suitable because it is the runtime identity passed to NVIDIA
-device discovery. For the lifetime of a live GI/CI, repeated allocations
-produce the same qualified name. Destruction ends that identity. If NVIDIA
-assigns a new UUID after recreation, HAMi publishes a new CDI name and removes
-the old one.
+The MIG UUID is the runtime identity passed to NVIDIA device discovery. For
+the lifetime of a live GI/CI, repeated allocations produce the same qualified
+name. Destruction ends that identity. If NVIDIA assigns a new UUID after
+recreation, HAMi publishes a new CDI name and removes the old one.
 
 The allocation key remains useful for idempotent hardware realization, but it
 must not be used as a CDI name that silently points to a different MIG UUID
 after recreation.
 
-The UUID-derived filename is validated before use; untrusted values cannot
-escape the configured CDI root.
+The hash-derived filename contains only safe characters; untrusted UUID text
+cannot escape the configured CDI root.
 
 ## CDI Specification Ownership
 
@@ -465,7 +467,7 @@ HAMi writes one CDI specification per live, HAMi-managed MIG UUID. A file is
 named from a validated UUID, for example:
 
 ```text
-/var/run/cdi/hami-dynamic-mig-MIG-xxxxxxxx.yaml
+/var/run/cdi/hami-dynamic-mig-<stable-UUID-hash>.yaml
 ```
 
 The actual path uses the configured CDI root instead of a hard-coded
@@ -940,7 +942,7 @@ model.
 
 - Vendor: reuse `k8s.device-plugin.nvidia.com`.
 - Class: use `dynamic-mig` so HAMi owns a separate identity namespace.
-- Filename: use `hami-dynamic-mig-<validated-MIG-UUID>.yaml` below the handler's CDI root.
+- Filename: use `hami-dynamic-mig-<stable-UUID-hash>.yaml` below the handler's CDI root.
 - CDI root: preserve `/var/run/cdi` as the default and inject it through an
   internal option for tests and future packaging needs.
 - Device edits: reuse toolkit common and parent-GPU edits, then construct the
