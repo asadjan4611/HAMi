@@ -72,7 +72,7 @@ Reserve placement -> create/reuse GI+CI -> resolve MIG UUID
 - Remove the entry when HAMi permanently destroys the corresponding instance.
 - Reconstruct CDI state for live, adopted instances after device-plugin
   restart.
-- Publish complete CDI files atomically.
+- Publish each MIG CDI file atomically.
 - Preserve non-CDI behavior and mixed CDI/non-CDI configurations.
 - Make lifecycle behavior deterministic, observable, race-free, and testable
   without requiring GPU hardware for unit tests.
@@ -329,18 +329,31 @@ profile-and-placement allocations.
 A CDI entry must never be published before the GI/CI exists and its MIG UUID
 and required device nodes have been resolved successfully.
 
-### Published CDI state is a derived snapshot
+### Per-device files are derived from live hardware
 
 The MIG manager's live allocation records are the runtime source of truth.
-The CDI handler keeps only the last successfully published registry so its
-memory state always describes the file that a runtime can read. The file is a
-replaceable snapshot, not an independent database. Startup and periodic
-reconciliation derive the desired snapshot again from live manager records.
+Each HAMi-owned CDI file describes exactly one MIG UUID. The file is not an
+independent database: startup recovery compares files with verified live
+instances, while runtime reconciliation deletes only files for instances it
+actually destroyed. Runtime reconciliation must never replace a full file set
+from a possibly stale snapshot.
 
 ### Ownership is explicit
 
-HAMi writes a dedicated dynamic specification and removes only that file or
-entries represented in that file. It does not edit or delete CDI files owned
+Dynamic MIG mode requires exclusive MIG lifecycle ownership for each managed
+physical GPU. HAMi must be the only controller creating, reconfiguring, or
+destroying GI/CI instances on that GPU. The ownership boundary is **per GPU**:
+one physical GPU cannot be shared between HAMi dynamic MIG and another MIG
+controller. The current plugin selects its operating mode per node, so an
+installation using the existing node-wide dynamic MIG mode must give HAMi
+exclusive control of the MIG lifecycle on all GPUs managed by that plugin.
+Per-GPU mixed static/dynamic configuration would require an explicit future
+configuration and discovery contract; this design does not enable it.
+Operators must not run NVIDIA MIG Manager or another dynamic MIG controller
+against HAMi-owned GPUs.
+
+HAMi writes a dedicated file per managed MIG UUID and removes only those files.
+It does not edit or delete CDI files owned
 by the NVIDIA Container Toolkit, GPU Operator, DRA driver, or an administrator.
 
 ### Allocation does not succeed before publication
@@ -363,37 +376,34 @@ The implementation is complete only while all of these remain true:
 2. A CDI name never changes to refer to another MIG UUID.
 3. A failed create publishes no entry, and a failed publication returns no CDI
    name.
-4. One container's multi-device CDI update is all-or-nothing.
-5. Hardware destruction is followed by removal from the desired CDI snapshot;
+4. An Allocate request returns no CDI names unless every requested MIG entry
+   was ensured; rollback removes only entries and hardware it created.
+5. Hardware destruction is followed by removal of the corresponding CDI file;
    failed removal remains retryable and observable.
 6. Startup state is reconstructed from verified live hardware and active Pod
    records, not trusted from a leftover CDI file.
 7. CDI-disabled allocation never depends on CDI initialization, files, or
    synchronization.
-8. HAMi mutates only its own dynamic CDI file.
+8. HAMi mutates only its own dynamic CDI files.
+9. At runtime, no operation replaces all dynamic MIG CDI files from a full
+   snapshot; full replacement is restricted to startup before Allocate serves.
 
 ## Proposed Architecture
 
-Add a dynamic MIG registry to the CDI handler. The registry stores immutable
-records indexed by MIG UUID and serializes specification publication. Add a
-small lifecycle coordinator in the NVIDIA plugin to order manager operations,
-CDI synchronization, allocation response construction, and rollback without
-making the MIG manager depend on CDI file formats.
+Add per-MIG file operations to the CDI handler. A small lifecycle coordinator
+in the NVIDIA plugin orders manager operations, CDI synchronization,
+allocation response construction, and rollback without making the MIG manager
+depend on CDI file formats. There is no node-wide runtime registry transaction.
 
 ```text
                     +----------------------+
-MIG manager ------> | Dynamic CDI registry | <------ restart adoption
- create/adopt       | UUID -> device entry |
+MIG manager ------> | CDI lifecycle handler |
+ create/adopt       | ensure/remove by UUID |
  destroy            +----------+-----------+
                                |
-                               | complete snapshot
+                               | atomic per-device write
                                v
-                    +----------------------+
-                    | atomic CDI publisher |
-                    +----------+-----------+
-                               |
-                               v
-                    /var/run/cdi/<HAMi-owned spec>
+                    /var/run/cdi/hami-dynamic-mig-<UUID>.yaml
                                |
                                v
                     containerd / CRI-O
@@ -413,7 +423,7 @@ tests.
 
 In dynamic MIG mode, the base `gpu` specification must exclude MIG devices.
 Otherwise a MIG device present during a plugin restart could be published once
-by startup discovery and again by the dynamic registry, and the startup entry
+by startup discovery and again by its dynamic per-UUID file, and the startup entry
 could become stale after destruction. Full GPUs and statically managed devices
 retain the existing base-spec behavior outside dynamic MIG mode.
 
@@ -421,7 +431,7 @@ retain the existing base-spec behavior outside dynamic MIG mode.
 
 The canonical device name is the exact MIG UUID returned by NVML after format
 validation. UUIDs are treated as opaque identities and are not case-folded or
-otherwise rewritten. The registry record is:
+otherwise rewritten. The CDI input record is:
 
 ```go
 type DynamicMIGDevice struct {
@@ -446,28 +456,28 @@ The allocation key remains useful for idempotent hardware realization, but it
 must not be used as a CDI name that silently points to a different MIG UUID
 after recreation.
 
-Before rendering, records are sorted by MIG UUID. Deterministic ordering keeps
-the file stable, makes content hashes meaningful, and avoids rewrites caused
-only by Go map iteration order.
+The UUID-derived filename is validated before use; untrusted values cannot
+escape the configured CDI root.
 
 ## CDI Specification Ownership
 
-HAMi writes one node-local dynamic specification containing all currently live
-HAMi-managed dynamic MIG devices. The filename is:
+HAMi writes one CDI specification per live, HAMi-managed MIG UUID. A file is
+named from a validated UUID, for example:
 
 ```text
-/var/run/cdi/hami-dynamic-mig.yaml
+/var/run/cdi/hami-dynamic-mig-MIG-xxxxxxxx.yaml
 ```
 
-The actual path must use the configured CDI root instead of a hard-coded
-directory. A single snapshot avoids one file per allocation, makes restart
-reconciliation simple, and bounds filesystem operations.
+The actual path uses the configured CDI root instead of a hard-coded
+directory. The number of MIG instances on a node is hardware-bounded. Each
+create or destroy touches only its own small file, so concurrent allocations
+cannot overwrite one another's CDI entries.
 
 The file contains:
 
 - one vendor/class pair owned by HAMi;
 - common NVIDIA container edits generated by the existing NVIDIA CDI library;
-- one device entry per live MIG UUID;
+- one device entry for that MIG UUID;
 - parent GPU and MIG GI/CI device nodes required by the runtime.
 
 Specification construction reuses the NVIDIA Container Toolkit CDI library
@@ -480,33 +490,30 @@ required device-node set explicit.
 
 ## Atomic Publication
 
-Every batch add, refresh, replace, or remove operation uses a copy-on-write
-transaction while holding the CDI registry mutex:
+For each MIG UUID independently:
 
-1. Copy the last successfully published registry into a candidate map.
-2. Apply every requested mutation to the candidate.
-3. Generate and validate the complete CDI specification from the candidate.
-4. Write a temporary file in the configured CDI directory.
-5. Close the file successfully.
-6. Atomically rename it over the final file.
-7. Only after the rename succeeds, replace the published registry with the
-   candidate, record the published content digest, and increment the published
-   generation.
-8. Remove the temporary file after any failure and keep both the previous file
-   and published registry unchanged.
+1. Generate and validate its complete CDI specification.
+2. Write a temporary file in the configured CDI directory.
+3. Close the file successfully and atomically rename it over the final file.
+4. Remove the temporary file after any failure; preserve an existing valid
+   final file.
 
-This commit-after-publication rule is required. Mutating the registry first
-would make an idempotent retry believe an entry was published even when the
-file write failed.
+An idempotent ensure verifies that an existing file still describes the
+expected UUID and device edits. If it is absent, invalid, or stale, ensure
+rebuilds that file. No process-global registry is needed to decide whether an
+entry exists. For one Allocate involving multiple MIG devices, ensure files
+one by one and return no Allocate response until every ensure succeeds.
+Rollback removes only the newly created files and GI/CI instances; preexisting
+live entries remain untouched.
 
 The implementation should prefer the CDI library's atomic `WriteSpec` or
 `Save` operation when the pinned library version provides the required
 temporary-file-and-rename guarantee. A second custom writer should not be
 introduced unless the library cannot meet the contract.
 
-When the candidate becomes empty, atomically remove the HAMi-owned dynamic
-spec and commit an empty published registry. A missing file is treated as
-success. HAMi must never remove another producer's file.
+Removal deletes only the validated, HAMi-owned filename for the destroyed MIG
+UUID. A missing file is treated as success. HAMi must never remove another
+producer's file.
 
 ## Interface Changes
 
@@ -519,19 +526,18 @@ type Interface interface {
     QualifiedName(class, id string) string
     AdditionalDevices() []string
 
-    EnsureDynamicMIGDevices([]DynamicMIGDevice) ([]string, error)
-    RemoveDynamicMIGDevices([]string) error
+    EnsureDynamicMIGDevice(DynamicMIGDevice) (string, error)
+    RemoveDynamicMIGDevice(string) error
     ReplaceDynamicMIGDevices([]DynamicMIGDevice) error
 }
 ```
 
-- `EnsureDynamicMIGDevices` is idempotent. It validates all existing records
-  and publishes all new entries in one file replacement. Returned names follow
-  input order.
-- `RemoveDynamicMIGDevices` is idempotent and removes only the matching UUIDs
-  in one file replacement.
-- `ReplaceDynamicMIGDevices` is used during startup recovery so the published
-  state exactly matches adopted live instances.
+- `EnsureDynamicMIGDevice` validates or publishes only the specified UUID's
+  file and returns its qualified name.
+- `RemoveDynamicMIGDevice` removes only the specified UUID's file.
+- `ReplaceDynamicMIGDevices` is **startup-only**, before the plugin serves
+  Allocate. It ensures files for verified adopted live instances and removes
+  stale HAMi-owned files. It must not be called during runtime reconciliation.
 - The null CDI handler implements these methods as no-ops only when CDI is not
   configured. Callers must not request a qualified name from the null handler.
 
@@ -539,9 +545,9 @@ Keeping the filesystem and spec-generation details behind the CDI interface
 allows unit tests to use an in-memory fake and prevents the MIG manager from
 depending on CDI file formats.
 
-Batch methods are intentional. A container can receive more than one dynamic
-MIG device. Publishing once per container gives the runtime an all-or-nothing
-view and avoids repeated generation and filesystem writes.
+The one-file-per-UUID interface keeps unrelated MIG allocations independent.
+An Allocate response remains all-or-nothing even though filesystem publication
+occurs per file: partial success must be rolled back before returning an error.
 
 ## Configuration and Capability Detection
 
@@ -569,7 +575,8 @@ the plugin follows this order before registering with kubelet:
 
 1. Reset only GPUs proven idle by the existing fail-closed startup logic.
 2. Adopt live dynamic MIG allocations from Pod annotations and NVML.
-3. Replace the dynamic CDI snapshot with exactly the adopted live records.
+3. Reconcile HAMi-owned per-MIG CDI files with the verified adopted live
+   records; remove stale files and ensure missing files.
 4. Generate or verify the non-dynamic base CDI specifications.
 5. Start and register the device-plugin server.
 
@@ -581,7 +588,7 @@ would require a separate proposal.
 
 Runtime capability cannot be proven only by checking a directory. Operators
 remain responsible for enabling CDI in containerd or CRI-O. HAMi should log
-the selected strategy, CDI root, dynamic-spec path, and whether dynamic MIG
+the selected strategy, CDI root, dynamic-spec filename prefix, and whether dynamic MIG
 CDI synchronization is active.
 
 ## Lifecycle Workflows
@@ -598,7 +605,7 @@ Ensure scheduler reservation is valid
 Create all required GI/CI pairs and resolve their MIG UUIDs
       |
       v
-Build and atomically publish all CDI entries in one batch
+Atomically publish one CDI file per MIG UUID
       |
       v
 Record runtime MIG information
@@ -607,11 +614,11 @@ Record runtime MIG information
 Return CDI-qualified name
 ```
 
-If any hardware creation fails, no CDI update is attempted and every GI/CI
-created by this request is rolled back. If batch publication fails, the
-allocation fails and those newly created instances are rolled back. Reused
-instances are never destroyed by that rollback. No qualified name is returned
-until the entire batch is published.
+If any hardware creation or CDI publication fails, the allocation fails.
+Rollback removes CDI files and GI/CI pairs created by this request, including
+earlier successful entries of a multi-device request. Reused instances and
+their CDI files are never destroyed by that rollback. No qualified names are
+returned until every requested file is valid.
 
 ### Reuse
 
@@ -619,9 +626,10 @@ When `EnsureAllocation` finds a tracked live instance:
 
 1. Obtain its MIG UUID and runtime information.
 2. Ask the CDI handler to ensure the entry exists and matches that UUID.
-3. Reuse the existing entry without rewriting the file if the in-memory record
-   and last published generation are unchanged.
-4. Republish when the entry is missing, stale, or not yet recovered.
+3. Reuse the existing file without rewriting it if it is valid for that live
+   UUID and its required device edits. Lazy recycling retains this file for as
+   long as the underlying GI/CI remains alive.
+4. Regenerate only that UUID's file when it is missing or stale.
 
 This fast path avoids unnecessary disk writes on repeated Allocate calls.
 
@@ -632,14 +640,12 @@ For permanent destruction:
 1. Serialize against allocation on the same physical GPU.
 2. Destroy the CI and GI through NVML.
 3. Remove the manager's live allocation record.
-4. Remove all destroyed MIG UUIDs from the CDI registry in one operation and
-   atomically publish the new snapshot.
+4. Remove only the corresponding HAMi-owned CDI file.
 
-If CDI removal fails after hardware destruction, keep the last-published map
-unchanged, mark CDI reconciliation dirty, and retry from a fresh snapshot of
-the manager's live records. A stale entry cannot provide access to destroyed
-hardware, but it must not remain indefinitely or be reused for a different
-identity.
+If CDI removal fails after hardware destruction, retain the UUID for an
+incremental cleanup retry; do not replace all files from a manager snapshot.
+A stale entry cannot provide access to destroyed hardware, but it must not
+remain indefinitely or be reused for a different identity.
 
 ### Allocation rollback
 
@@ -653,14 +659,16 @@ After the plugin adopts live MIG instances from Pod allocation records and
 NVML, and before it registers with kubelet:
 
 1. Build a complete list of successfully adopted runtime identities.
-2. Replace the dynamic CDI registry with that list.
-3. Publish one atomic snapshot.
-4. Remove entries for instances that no longer exist.
+2. Ensure a valid per-MIG CDI file for each adopted UUID.
+3. Remove stale HAMi-owned per-MIG files that have no live adopted instance.
+4. Do not touch CDI files owned by other producers.
 5. Begin serving Allocate only after synchronization succeeds when CDI-only
    operation is configured.
 
-Recovery is replace-based instead of a sequence of individual additions, so a
-restart cannot preserve entries from an earlier process accidentally.
+This is the only phase that uses `ReplaceDynamicMIGDevices`. It runs before
+Allocate starts serving, so no concurrent new allocation can be removed by a
+stale startup snapshot. A failed or incomplete hardware/Pod inventory must
+fail closed and must not authorize deletion of existing files.
 
 ## Transaction and Failure Semantics
 
@@ -670,10 +678,10 @@ restart cannot preserve entries from an earlier process accidentally.
 | CI creation fails | Destroy partial GI; publish nothing. |
 | MIG UUID discovery fails | Destroy newly created GI/CI; publish nothing. |
 | Device-spec generation fails | Fail allocation and roll back newly created GI/CI. |
-| Atomic CDI write fails | Keep the previous complete file and published registry; fail CDI allocation. |
+| Atomic CDI write fails | Keep the previous complete file for that UUID; fail CDI allocation. |
 | CDI refresh fails for reused live MIG | Keep hardware; fail this allocation and retry later. |
 | Hardware destruction fails | Keep CDI entry because the device may still be live. |
-| CDI removal fails after successful destruction | Keep published state, mark reconciliation dirty, and retry from manager state. |
+| CDI removal fails after successful destruction | Retain UUID for incremental cleanup retry. |
 | Pod annotation update fails after creation | Existing allocation rollback removes newly created hardware and CDI state. |
 
 The publication API must distinguish a newly created instance from a reused
@@ -683,10 +691,10 @@ successful allocation.
 ## Concurrency and Lock Ordering
 
 CDI lifecycle updates can race with concurrent Allocate calls, periodic
-reconciliation, startup adoption, and rollback. A lifecycle coordinator owns
-a keyed lock for each allocation key. The existing MIG manager keeps its
-per-GPU hardware locks, and the CDI handler keeps one registry/publication
-mutex.
+reconciliation, and rollback. A lifecycle coordinator owns a keyed lock for
+each allocation key. The existing MIG manager keeps its per-GPU hardware
+locks. The CDI handler serializes only operations for the **same UUID**;
+independent files require no global publication lock.
 
 The coordinator executes operations in this order:
 
@@ -695,34 +703,30 @@ allocation-key lifecycle lock
         |
         +--> MIG manager call (takes and releases its per-GPU lock)
         |
-        +--> CDI batch call (takes and releases the registry lock)
+        +--> CDI ensure/remove for that UUID
 ```
 
 The manager's per-GPU lock is not held during CDI filesystem I/O. This avoids
 blocking unrelated NVML work on a slow disk. The allocation-key lock stays
 held across both calls, so create and destroy for the same logical allocation
-cannot pass each other. Different allocation keys can perform NVML work in
-parallel where the manager permits it; CDI publication is necessarily
-serialized because all entries share one snapshot file.
+cannot pass each other. Different allocation keys can perform NVML work and
+CDI publication in parallel where the manager permits it. A multi-device
+request acquires keyed locks in deterministic order to avoid deadlock.
 
 No CDI method may call the MIG manager, and no manager method may call the CDI
-handler. Periodic reconciliation must use the lifecycle coordinator instead
-of calling `MigInstanceManager.ReconcileActiveAllocations` directly. This rule
-ensures every permanent hardware removal has a corresponding CDI removal and
-prevents an older snapshot from overwriting a newer one.
-
-Each successful publication increments an in-memory generation. An
-idempotent batch ensure can skip publication only when every requested record
-is identical to the last successfully published registry and the dynamic spec
-at its expected path still validates against the recorded content digest. A
-missing, truncated, externally replaced, or invalid file is regenerated even
-when the in-memory records match.
+handler. Periodic reconciliation must return the UUIDs of instances it
+**actually destroyed**, then remove only those CDI files through the
+coordinator. A stale list of desired allocations must never trigger a runtime
+full replacement. Before deleting a file after reconciliation, recheck under
+the keyed lock that the UUID has not been reused or adopted by another
+allocation. A missing, truncated, externally replaced, or invalid file is
+repaired only by an ensure for its live UUID.
 
 ## Allocation Response
 
-The dynamic path returns the qualified names produced by
-`EnsureDynamicMIGDevices`, rather than independently reconstructing them. This
-couples each returned identity to an entry that was actually published.
+The dynamic path returns the qualified names produced by successive
+`EnsureDynamicMIGDevice` calls, rather than independently reconstructing them.
+This couples each returned identity to an entry that was actually published.
 
 The current response helper accepts raw device IDs and qualifies them as the
 `gpu` class. Dynamic MIG must not pass an already qualified name through that
@@ -757,7 +761,7 @@ Add structured logs for:
 
 - dynamic CDI synchronization enabled or disabled;
 - entry added, reused, refreshed, and removed;
-- snapshot generation and entry count;
+- per-device publication and live entry count;
 - publication duration and failure;
 - restart reconstruction count;
 - deferred stale-entry cleanup.
@@ -794,25 +798,25 @@ tests.
 
 ### Unit tests without GPU hardware
 
-- Adding the first MIG record creates a valid specification.
-- Adding multiple records produces one complete specification.
-- A multi-device Allocate publishes one batch and returns names in request
-  order.
+- Adding the first MIG record creates a valid per-UUID specification.
+- Adding multiple records produces independent valid files.
+- A multi-device Allocate returns names only after every per-UUID ensure
+  succeeds; partial failure rolls back only new instances and files.
 - Re-adding an identical record returns the same qualified name and avoids an
   unnecessary write.
 - Re-adding an identical record repairs a missing, corrupted, or externally
   replaced dynamic spec instead of taking the no-op path.
-- Records are rendered in stable MIG-UUID order.
+- Distinct UUIDs resolve to distinct, HAMi-owned filenames.
 - Replacing a conflicting UUID record does not preserve the old name.
-- Removing a record republishes the remaining entries.
-- Removing the final record removes the HAMi-owned spec.
+- Removing one UUID deletes only its own file and preserves others.
+- Removing the final UUID leaves no HAMi-owned dynamic MIG files.
 - Missing-file removal succeeds.
 - Invalid UUIDs and invalid generated specs are rejected.
 - A failed write leaves the previous complete file readable.
-- A failed write leaves the in-memory published registry equal to the previous
-  file, so a retry does not incorrectly take the no-op path.
-- Concurrent ensure/remove operations pass `go test -race` and the final file
-  matches the final registry generation.
+- A failed write leaves other UUIDs' files unchanged; a retry regenerates
+  only the failed UUID's file.
+- Concurrent ensure/remove operations for distinct UUIDs pass `go test -race`
+  and never overwrite another UUID's file.
 - Startup replacement removes stale entries and retains adopted live entries.
 - The null handler remains safe when CDI is disabled.
 - CDI annotation and CRI response strategies receive the published qualified
@@ -834,9 +838,9 @@ interface. No NVML or GPU is required for these tests.
 - Validate generated YAML/JSON with the pinned CDI library.
 - Start a CDI cache against the temporary directory and resolve every returned
   qualified name.
-- Keep a reader loop parsing the final path while writers replace snapshots;
-  the reader must observe only the old or new valid specification, never a
-  partial document.
+- Keep a reader loop parsing a per-UUID final path while its writer replaces
+  that file; the reader must observe only the old or new valid specification,
+  never a partial document.
 - Simulate device-plugin restart and adoption.
 - Run lifecycle tests repeatedly and with the Go race detector.
 
@@ -864,13 +868,13 @@ Validate:
 
 1. Pass dynamic-MIG mode and the CDI root into the CDI handler; filter MIG
    entries from the base spec in this mode.
-2. Add the lifecycle coordinator, batch CDI interface, copy-on-write registry,
-   atomic writer, and unit tests without changing allocation behavior.
-3. Connect dynamic MIG create/reuse to batch CDI ensure and return the
+2. Add per-UUID lifecycle operations, atomic per-file writer, and unit tests
+   without changing allocation behavior.
+3. Connect dynamic MIG create/reuse to per-UUID ensure and return the
    published qualified names without double qualification.
-4. Connect rollback, destruction, and periodic reconciliation to batch
-   removal through the coordinator.
-5. Add pre-registration startup replacement from adopted allocations.
+4. Connect rollback, destruction, and periodic reconciliation to incremental
+   removal of UUIDs actually destroyed.
+5. Add pre-registration startup replacement from adopted allocations only.
 6. Add logs and bounded metrics.
 7. Validate with a CDI-enabled runtime and real MIG hardware.
 8. Document operator prerequisites and troubleshooting after hardware results
@@ -884,10 +888,13 @@ This is simple but mixes static discovery with HAMi-owned dynamic lifecycle,
 increases collision risk, and makes cleanup ownership unclear. A dedicated
 dynamic specification is safer.
 
-### One CDI file per MIG UUID
+### One node-wide CDI file for all dynamic MIG devices
 
-This gives simple deletion but creates more filesystem churn and stale-file
-cleanup work. A single atomic snapshot is easier to reconcile and bound.
+This reduces the file count but requires every runtime create or destroy to
+rewrite a shared snapshot. An older snapshot can overwrite an entry published
+by a concurrent allocation. The bounded number of MIG instances does not
+justify this extra synchronization and failure scope. Per-UUID files isolate
+updates and simplify runtime lifecycle operations.
 
 ### Use allocation key as the CDI name
 
@@ -917,9 +924,9 @@ model.
 | Risk | Mitigation |
 | --- | --- |
 | Runtime reads a partial file | CDI library atomic write/rename. |
-| Stale entry survives restart | Replace registry from adopted live instances before serving. |
-| Concurrent snapshots overwrite each other | One registry mutex and monotonic generation. |
-| Failed publication poisons the no-op cache | Commit registry state only after successful rename. |
+| Stale file survives restart | Startup-only replacement reconciles files against verified adopted instances before serving. |
+| Concurrent allocation loses a CDI entry | Separate per-UUID files; runtime never replaces the whole set. |
+| Failed publication damages another allocation | Atomic per-UUID write; other files remain unchanged. |
 | CDI failure leaks new hardware | Integrate with existing newly-created allocation rollback. |
 | Cleanup removes another producer's spec | Dedicated HAMi-owned filename and class. |
 | Duplicate device names across specs | Dedicated class and UUID-based names. |
@@ -933,7 +940,7 @@ model.
 
 - Vendor: reuse `k8s.device-plugin.nvidia.com`.
 - Class: use `dynamic-mig` so HAMi owns a separate identity namespace.
-- Filename: use `hami-dynamic-mig.yaml` below the handler's CDI root.
+- Filename: use `hami-dynamic-mig-<validated-MIG-UUID>.yaml` below the handler's CDI root.
 - CDI root: preserve `/var/run/cdi` as the default and inject it through an
   internal option for tests and future packaging needs.
 - Device edits: reuse toolkit common and parent-GPU edits, then construct the
@@ -943,8 +950,8 @@ model.
 - Failure mode: fail startup before kubelet registration when initial required
   CDI reconciliation fails; fail the individual Allocate on later publication
   errors.
-- Cleanup failure: emit an error metric and retry during the existing periodic
-  reconciliation loop; do not make a destroyed device accessible and do not
+- Cleanup failure: emit an error metric and retry removal of that UUID during
+  the existing periodic reconciliation loop; do not replace all files or
   delete another producer's file.
 - Readiness: do not add a new readiness API. Startup failure, allocation
   errors, logs, and bounded metrics provide the signals required by this
@@ -956,8 +963,8 @@ model.
 
 - A newly created dynamic MIG device has a valid CDI entry before Allocate
   returns its qualified name.
-- Every device in one multi-device allocation is published atomically in one
-  snapshot before any qualified names are returned.
+- Every device in one multi-device allocation has a valid per-UUID file before
+  any qualified names are returned; partial failure rolls back only new work.
 - The name resolves to the correct live MIG UUID and required device nodes.
 - Reusing the same live instance returns the same name without unnecessary
   file writes.
@@ -965,9 +972,12 @@ model.
 - Restart recovery reconstructs exactly the set of adopted live instances.
 - Device-plugin registration occurs only after required startup CDI
   reconciliation succeeds.
-- All specification replacements are atomic.
-- A failed replacement leaves both the previous file and published registry
-  unchanged.
+- All per-UUID file replacements are atomic.
+- A failed replacement leaves the previous valid file for that UUID and all
+  unrelated files unchanged.
+- Runtime reconciliation removes only UUIDs of instances actually destroyed;
+  full file-set replacement occurs only during startup recovery.
+- HAMi is the exclusive MIG lifecycle controller for each managed GPU.
 - Concurrent lifecycle operations pass race-detector tests.
 - CDI-only startup and allocation failures produce clear errors.
 - Non-CDI and mixed strategies retain their documented behavior.
